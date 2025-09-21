@@ -1,0 +1,264 @@
+﻿@page
+@{
+    ViewData["Title"] = "OSMD Demo";
+}
+
+<h1>OpenSheetMusicDisplay — простий приклад</h1>
+<p>Нижче рендериться MusicXML за допомогою OpenSheetMusicDisplay.</p>
+
+<div class="mb-3">
+    <button id="openFileBtn" class="btn btn-primary">Відкрити файл (.mxl)</button>
+    <input id="fileInput" type="file" accept=".mxl,.musicxml,.xml" style="display:none" />
+    <span id="fileName" class="ms-2 text-muted"></span>
+</div>
+
+<div class="mb-2">
+    <button id="playBtn" class="btn btn-success btn-sm">Play</button>
+    <button id="stopBtn" class="btn btn-outline-secondary btn-sm">Stop</button>
+    <span class="ms-2 text-muted">Демо-відтворення з підсвіченням долі такту (курсором)</span>
+</div>
+
+<!-- Tempo controls -->
+<div class="mb-3 d-flex align-items-center">
+    <label for="bpmRange" class="form-label mb-0 me-2">Tempo</label>
+    <input id="bpmRange" type="range" min="30" max="240" step="1" value="100" style="width: 240px;">
+    <input id="bpmBox" type="number" min="30" max="240" step="1" class="form-control form-control-sm ms-2" style="width: 90px;" value="100">
+    <span class="ms-1">BPM</span>
+</div>
+
+<div id="osmd" style="width:100%; min-height: 60vh; border: 1px solid #ddd; padding: 8px;"></div>
+
+@section Scripts {
+    <script src="https://unpkg.com/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
+    <script>
+        (function () {
+            const container = document.getElementById('osmd');
+            const scoreUrl = '@Url.Content("~/lib/opensheetmusicdisplay/demo/BrookeWestSample.musicxml")';
+
+            // Resolve OSMD constructor from different possible globals
+            const ns = window.opensheetmusicdisplay || window.OSMD || window.osmd || window;
+            const OSMD_Ctor = ns && (ns.OpenSheetMusicDisplay || ns.default || window.OpenSheetMusicDisplay);
+            if (!OSMD_Ctor) {
+                console.error('OSMD script not loaded or global not found.');
+                container.innerText = 'Помилка: бібліотека OSMD не завантажена.';
+                return;
+            }
+
+            const osmd = new OSMD_Ctor(container, {
+                autoResize: true,
+                drawTitle: true,
+                // Additional cursors for highlighting
+                cursorsOptions: [
+                    { type: 1, color: '#26a69a', alpha: 0.9, follow: true }, // beat line
+                    { type: 3, color: '#ffee58', alpha: 0.2, follow: true }   // measure highlight
+                ]
+            });
+
+            // Render default example
+            fetch(scoreUrl, { credentials: 'same-origin' })
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status} while fetching score`);
+                    return r.text();
+                })
+                .then(xml => osmd.load(xml))
+                .then(() => {
+                    osmd.render();
+                    initTempoFromScore();
+                })
+                .catch(err => {
+                    console.error('OSMD load/render error', err);
+                    container.innerText = 'Помилка завантаження/рендерингу: ' + err;
+                });
+
+            // Open local file
+            const openBtn = document.getElementById('openFileBtn');
+            const fileInput = document.getElementById('fileInput');
+            const fileNameSpan = document.getElementById('fileName');
+
+            openBtn.addEventListener('click', () => fileInput.click());
+
+            fileInput.addEventListener('change', () => {
+                const file = fileInput.files && fileInput.files[0];
+                if (!file) return;
+
+                stopPlayback();
+                fileNameSpan.textContent = file.name;
+                const lower = file.name.toLowerCase();
+                const reader = new FileReader();
+
+                if (lower.endsWith('.mxl')) {
+                    reader.onload = (e) => {
+                        const buffer = e.target.result; // ArrayBuffer
+                        const binary = arrayBufferToBinaryString(buffer);
+                        osmd.load(binary)
+                            .then(() => {
+                                osmd.render();
+                                initTempoFromScore();
+                            })
+                            .catch(err => {
+                                console.error('OSMD load/render error (.mxl)', err);
+                                container.innerText = 'Помилка завантаження/рендерингу (.mxl): ' + err;
+                            });
+                    };
+                    reader.readAsArrayBuffer(file);
+                } else {
+                    reader.onload = (e) => {
+                        const text = e.target.result;
+                        osmd.load(text)
+                            .then(() => {
+                                osmd.render();
+                                initTempoFromScore();
+                            })
+                            .catch(err => {
+                                console.error('OSMD load/render error (.xml)', err);
+                                container.innerText = 'Помилка завантаження/рендерингу (.xml): ' + err;
+                            });
+                    };
+                    reader.readAsText(file);
+                }
+            });
+
+            // ---- Simple WebAudio playback with cursor ----
+            const playBtn = document.getElementById('playBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            const bpmRange = document.getElementById('bpmRange');
+            const bpmBox = document.getElementById('bpmBox');
+
+            let audioCtx = null;
+            let playing = false;
+            let playTimer = null;
+            let bpm = 100; // default; can be overridden by score
+
+            // tempo controls sync
+            function setTempoUI(val) {
+                bpmRange.value = String(val);
+                bpmBox.value = String(val);
+            }
+            function setTempo(val) {
+                const clamped = Math.max(30, Math.min(240, Math.round(Number(val) || bpm)));
+                bpm = clamped;
+                setTempoUI(bpm);
+                // if playing, reschedule next step to reflect new tempo immediately
+                if (playing) {
+                    if (playTimer) clearTimeout(playTimer);
+                    step();
+                }
+            }
+            bpmRange.addEventListener('input', () => setTempo(bpmRange.value));
+            bpmBox.addEventListener('input', () => setTempo(bpmBox.value));
+            setTempoUI(bpm);
+
+            function initTempoFromScore() {
+                // Try to read BPM from the score (metronome/tempo). Fallback to default.
+                const m0 = osmd?.Sheet?.SourceMeasures?.[0];
+                const scoreBpm = (m0?.TempoInBPM && isFinite(m0.TempoInBPM) && m0.TempoInBPM > 0)
+                    ? m0.TempoInBPM
+                    : (osmd?.Sheet?.DefaultStartTempoInBpm && isFinite(osmd.Sheet.DefaultStartTempoInBpm) ? osmd.Sheet.DefaultStartTempoInBpm : null);
+                if (scoreBpm) setTempo(scoreBpm);
+            }
+
+            playBtn.addEventListener('click', () => {
+                if (playing) return;
+                if (!osmd.GraphicSheet && !osmd.graphic) return;
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+                osmd.FollowCursor = true;
+                const cur = getCursor();
+                if (!cur) return;
+                cur.reset();
+                cur.show();
+                playing = true;
+                step();
+            });
+
+            stopBtn.addEventListener('click', () => stopPlayback());
+
+            function stopPlayback() {
+                playing = false;
+                if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+                const cur = getCursor();
+                cur?.hide();
+            }
+
+            function step() {
+                if (!playing) return;
+                const cur = getCursor();
+                if (!cur) return stopPlayback();
+
+                // sound for notes under cursor
+                const notes = (typeof cur.NotesUnderCursor === 'function') ? cur.NotesUnderCursor() : [];
+                if (notes && notes.length) {
+                    const freqs = notes.map(n => midiToFreq(n.halfTone));
+                    beepChord(freqs, 0.9); // short beep
+                }
+
+                // compute delta to next timestamp (in “quarters”)
+                const currentTs = cur.Iterator?.currentTimeStamp?.RealValue ?? 0;
+                cur.next();
+                const nextTs = cur.Iterator?.currentTimeStamp?.RealValue ?? currentTs;
+                cur.previous();
+
+                let deltaQuarter = estimateDeltaQuarters(currentTs, nextTs);
+                if (deltaQuarter <= 0 || !isFinite(deltaQuarter)) deltaQuarter = 0.25;
+
+                const seconds = (60 / bpm) * deltaQuarter;
+
+                playTimer = setTimeout(() => {
+                    if (!playing) return;
+                    cur.next();
+                    if (cur.Iterator?.EndReached) {
+                        stopPlayback();
+                        return;
+                    }
+                    step();
+                }, seconds * 1000);
+            }
+
+            function estimateDeltaQuarters(tsNow, tsNext) {
+                // RealValue here is in quarters already for our cursor stepping logic
+                let delta = tsNext - tsNow;
+                if (!isFinite(delta)) delta = 0.25;
+                return Math.max(delta, 0.0625); // >= 1/16 of a quarter
+            }
+
+            function beepChord(freqs, gainScale) {
+                if (!audioCtx || !freqs || freqs.length === 0) return;
+                const durSec = 0.2;
+                const now = audioCtx.currentTime;
+
+                const gain = audioCtx.createGain();
+                gain.gain.setValueAtTime(0.0001, now);
+                gain.gain.exponentialRampToValueAtTime(0.2 * (gainScale ?? 1), now + 0.01);
+                gain.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+                gain.connect(audioCtx.destination);
+
+                for (const f of freqs) {
+                    const osc = audioCtx.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.value = f;
+                    osc.connect(gain);
+                    osc.start(now);
+                    osc.stop(now + durSec);
+                }
+            }
+
+            function midiToFreq(m) { return 880 * Math.pow(2, (m - 69) / 12); } // A4 ref (demo)
+
+            function getCursor() {
+                return (osmd.cursors && osmd.cursors[0]) ? osmd.cursors[0] : osmd.cursor;
+            }
+
+            // ArrayBuffer -> binary string (chunked) for .mxl
+            function arrayBufferToBinaryString(buffer) {
+                const bytes = new Uint8Array(buffer);
+                const chunkSize = 0x8000; // 32k
+                let binary = '';
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    const chunk = bytes.subarray(i, i + chunkSize);
+                    binary += String.fromCharCode.apply(null, chunk);
+                }
+                return binary;
+            }
+        })();
+    </script>
+}
