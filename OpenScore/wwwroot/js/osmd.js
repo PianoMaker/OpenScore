@@ -1,8 +1,13 @@
 ﻿'use strict';
+// ====================
+// OpenSheetMusicDisplay (OSMD) example with simple WebAudio playback and cursor
+// Assumes OSMD script is loaded in page
+// ====================
 (function () {
     const container = document.getElementById('osmd');
     if (!container) return;
 
+	// data-score-url attribute can specify a default score to load
     const scoreUrl = container.getAttribute('data-score-url');
 
     // Resolve OSMD constructor from different possible globals
@@ -14,6 +19,10 @@
         return;
     }
 
+    // Create OSMD instance
+    // with cursor support
+    // (cursorsOptions requires OSMD 1.8.2+)
+	// See https://opensheetmusicdisplay.github.io/docs/usage/cursors/
     const osmd = new OSMD_Ctor(container, {
         autoResize: true,
         drawTitle: true,
@@ -48,8 +57,10 @@
     const fileNameSpan = document.getElementById('fileName');
 
     if (openBtn && fileInput) {
+		// forward button click to hidden file input
         openBtn.addEventListener('click', () => fileInput.click());
 
+		// on file selection
         fileInput.addEventListener('change', () => {
             const file = fileInput.files && fileInput.files[0];
             if (!file) return;
@@ -58,7 +69,10 @@
             if (fileNameSpan) fileNameSpan.textContent = file.name;
             const lower = file.name.toLowerCase();
             const reader = new FileReader();
-
+            // .mxl = zipped, needs ArrayBuffer + conversion to binary string
+            // .xml = plain text
+            // other extensions may also be XML, but we keep it simple here
+			// https://opensheetmusicdisplay.github.io/docs/usage/loading/
             if (lower.endsWith('.mxl')) {
                 reader.onload = (e) => {
                     const buffer = e.target.result; // ArrayBuffer
@@ -108,6 +122,13 @@
         if (bpmRange) bpmRange.value = String(val);
         if (bpmBox) bpmBox.value = String(val);
     }
+    // set tempo (clamped) and restart if playing
+    // also used to init from score
+    // val can be number or string
+    // returns clamped number
+    // updates UI controls
+    // restarts playback step if playing
+	// clamps to [30..240]
     function setTempo(val) {
         const clamped = Math.max(30, Math.min(240, Math.round(Number(val) || bpm)));
         bpm = clamped;
@@ -121,6 +142,19 @@
     if (bpmBox) bpmBox.addEventListener('input', () => setTempo(bpmBox.value));
     setTempoUI(bpm);
 
+    //====================
+    // Initialize tempo from score
+	//====================
+    
+    // init tempo from score's first measure or default
+    // called after rendering
+    // does not restart playback
+    // if no valid tempo found, keeps current bpm
+    // (which may be default 100 or user-set)
+    // valid tempo: finite number > 0
+    // looks at first measure's TempoInBPM, then Sheet.DefaultStartTempoInBpm
+    // if both missing/invalid, does nothing
+	// see https://opensheetmusicdisplay.github.io/docs/usage/tempo/
     function initTempoFromScore() {
         const m0 = osmd?.Sheet?.SourceMeasures?.[0];
         const scoreBpm = (m0?.TempoInBPM && isFinite(m0.TempoInBPM) && m0.TempoInBPM > 0)
@@ -152,6 +186,41 @@
         cur?.hide();
     }
 
+    //====================
+    // Playback step function
+    ///====================
+	// plays sound for notes under cursor
+    // advances cursor
+    // sets timer for next step
+    // uses global playing, playTimer, bpm, osmd, audioCtx
+	// if not playing, does nothing
+    // if at end, stops playback
+    // uses getCursor() to get current cursor
+    // computes delta to next timestamp and sets timer
+    // if delta invalid, uses 0.25 quarters (default)
+    // minimum delta is 0.0625 quarters (1/16)
+    // sounds all notes under cursor as short chord
+    // uses beepChord() for sound
+    // uses midiToFreq() for note frequencies
+    // uses estimateDeltaQuarters() to compute delta
+    // uses setTimeout for scheduling
+    // (WebAudio scheduling would be more precise, but more complex)
+    // assumes osmd and audioCtx are valid
+    // assumes bpm is valid
+    // cursor must have NotesUnderCursor() method (OSMD 1.8.2+)
+    // (or else plays no sound)
+    // if no notes under cursor, plays no sound
+    // gainScale = 0.9 to avoid clipping with multiple notes
+    // (can be adjusted if needed)
+    // uses exponentialRamp for gain envelope
+    // duration 0.5s
+    // can be modified if needed
+    // uses sine wave oscillators
+    // can be modified for different sound
+    // connects to audioCtx.destination
+    // cleans up oscillators after stopping
+    // (no need to keep references)
+    
     function step() {
         if (!playing) return;
         const cur = getCursor();
@@ -194,7 +263,7 @@
 
     function beepChord(freqs, gainScale) {
         if (!audioCtx || !freqs || freqs.length === 0) return;
-        const durSec = 0.2;
+        const durSec = 0.5;
         const now = audioCtx.currentTime;
 
         const gain = audioCtx.createGain();
